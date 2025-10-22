@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>نظام الحضور</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#10b981"/>
+<style>
+ body { font-family: Arial, sans-serif; direction: rtl; text-align: center; margin: 20px; }
+ #reader { width: 300px; margin: 20px auto; }
+ .btn-group button { margin: 5px; padding:10px 20px; font-size:16px; cursor:pointer; border-radius:6px; border: none; }
+ .btn-group button:hover { opacity:0.9; }
+ .btn-group .in { background:#3b82f6; color:white; }
+ .btn-group .out { background:#f59e0b; color:white; }
+ .btn-group .eve { background:#ef4444; color:white; }
+ #exportBtn { margin-top:10px; padding:8px 14px; border-radius:6px; background:#06b6d4; color:white; border:none; cursor:pointer; }
+ #exportBtn:active { transform:translateY(1px); }
+ #recordsTable { display:none; }
+ .confirmation-message{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgba(16,185,129,0.95);color:white;padding:10px 20px;border-radius:8px;font-size:16px;z-index:9999;display:none;}
+ #selectedTypeText{margin-top:12px;font-weight:600;color:#374151;}
+</style>
+</head>
+<body>
+<h2>📌 نظام الحضور والانصراف</h2>
+<div class="btn-group" role="toolbar" aria-label="اختيار نوع الحركة">
+ <button class="in" onclick="setMovement('دخول')">دخول</button>
+ <button class="out" onclick="setMovement('انصراف')">خروج</button>
+ <button class="eve" onclick="setMovement('انصراف مسائي')">مسائي</button>
+</div>
+<p id="selectedTypeText">الرجاء اختيار نوع الحركة قبل المسح</p>
+<div id="reader" style="display:none;"></div>
+<button id="exportBtn" onclick="exportToExcel()">تصدير إلى Excel</button>
+<div id="confirmMsg" class="confirmation-message" role="status" aria-live="polite"></div>
+
+<script src="https://unpkg.com/html5-qrcode"></script>
+<script>
+// ----- CONFIG -----
+// ضع هنا رابط Web App الخاص بك (Apps Script)
+const GOOGLE_SCRIPT_URL = 'YOUR_GOOGLE_SCRIPT_URL';
+
+// ----- State -----
+const beepSound = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=');
+let movementType = '';
+let records = [];
+let currentScanner = null;
+let lastScannedId = null;
+let lastScannedAt = 0;
+const DEBOUNCE_MS = 2000; // منع المسح المتكرر لنفس الكود خلال 2s
+
+function playBeep(){ try{ beepSound.play(); }catch(e){ console.warn(e); } }
+
+function showConfirmation(record){
+  const msg = document.getElementById('confirmMsg');
+  msg.textContent = `✅ تم تسجيل ${record.movement} لـ ${record.name}`;
+  msg.style.display = 'block';
+  setTimeout(()=>{ msg.style.display='none'; },2000);
+}
+
+function setMovement(type){
+ movementType = type;
+ document.getElementById('selectedTypeText').innerText = 'نوع الحركة المختار: ' + type;
+ document.getElementById('reader').style.display = 'block';
+ startScanner();
+}
+
+// ----- Scanner -----
+function startScanner(){
+ if (currentScanner) return; // already running
+ const html5Qr = new Html5Qrcode("reader");
+ currentScanner = html5Qr;
+ const config = { fps: 10, qrbox: { width: 250, height: 250 } };
+ Html5Qrcode.getCameras().then(devices => {
+    if (devices && devices.length) {
+       const rear = devices.find(d => (d.label||'').toLowerCase().includes('back') || (d.label||'').toLowerCase().includes('rear')) || devices[0];
+       html5Qr.start(rear.id || { facingMode: "environment" }, config, qrCodeMessage => {
+           const now = Date.now();
+           if (qrCodeMessage === lastScannedId && (now - lastScannedAt) < DEBOUNCE_MS) {
+               return; // ignore rapid duplicate
+           }
+           lastScannedId = qrCodeMessage;
+           lastScannedAt = now;
+           // stop, save, then restart
+           html5Qr.stop().then(()=>{
+               currentScanner = null;
+               saveRecord(qrCodeMessage);
+               // small delay before restarting to allow camera to reinitialize
+               setTimeout(()=> startScanner(), 800);
+           }).catch(err => {
+               console.error('Stop failed', err);
+               currentScanner = null;
+               saveRecord(qrCodeMessage);
+               setTimeout(()=> startScanner(), 800);
+           });
+       }, errorMessage => {
+           // ignore scan errors
+       }).catch(err => {
+           console.error('Start failed', err);
+           document.getElementById('selectedTypeText').innerText = 'خطأ: لا يمكن الوصول إلى الكاميرا. تأكد من الأذونات.';
+       });
+    } else {
+       document.getElementById('selectedTypeText').innerText = 'خطأ: لم يتم العثور على كاميرا.';
+    }
+ }).catch(err => {
+    console.error('Cameras error', err);
+    document.getElementById('selectedTypeText').innerText = 'خطأ: فشل في الحصول على قائمة الكاميرات.';
+ });
+}
+
+function stopScanner(){
+ if (!currentScanner) return;
+ currentScanner.stop().then(()=>{ currentScanner.clear(); currentScanner = null; document.getElementById('selectedTypeText').innerText = 'تم إيقاف الماسح.'; }).catch(()=>{ currentScanner = null; });
+}
+
+// ----- Records management -----
+function createLocalRecord(employeeId){
+ const now = new Date();
+ // استخدام التوقيت المحلي للجهاز (عادة يطابق توقيت مصر إذا الجهاز مضبوط)
+ const record = {
+   id: `local-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+   name: String(employeeId).trim(),
+   movement: movementType,
+   timestamp: now.toISOString(),
+   date: now.toLocaleDateString('ar-EG'),
+   time: now.toLocaleTimeString('ar-EG'),
+   source: 'QR'
+ };
+ return record;
+}
+
+function saveRecord(qr){
+ const record = createLocalRecord(qr);
+ records.unshift(record);
+ // حفظ محليًا (localStorage)
+ try { localStorage.setItem('attendance_records_v2', JSON.stringify(records)); } catch(e){}
+ sendToGoogle(record);
+ playBeep();
+ showConfirmation(record);
+ // تحديث زر التصدير (لا عرض للسجلات في الواجهة)
+ document.getElementById('exportBtn').disabled = records.length === 0;
+}
+
+function sendToGoogle(record){
+ try {
+   const params = new URLSearchParams();
+   params.append('records_batch', JSON.stringify([{
+     id: record.id,
+     employee_id: record.name,
+     movement_type: record.movement,
+     timestamp: record.timestamp,
+     source: record.source
+   }]));
+   // إرسال باستخدام fetch (no-cors) ثم محاولة sendBeacon كاحتياط
+   fetch(GOOGLE_SCRIPT_URL, {
+     method: 'POST',
+     mode: 'no-cors',
+     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+     body: params.toString()
+   }).catch(e => {
+     try {
+       if (navigator.sendBeacon) {
+         const blob = new Blob([params.toString()], { type: 'application/x-www-form-urlencoded' });
+         navigator.sendBeacon(GOOGLE_SCRIPT_URL, blob);
+       }
+     } catch(be) { console.warn(be); }
+   });
+ } catch(e){ console.warn(e); }
+}
+
+function exportToExcel(){
+ const data = records.slice().sort((a,b)=> new Date(b.timestamp) - new Date(a.timestamp));
+ const headers = ['معرف السجل','رمز الموظف','نوع الحركة','الوقت','المصدر'];
+ let csv = headers.join(',') + '\n';
+ const escapeVal = v => { if (v==null) return ''; let s = String(v); if (s.includes(',')||s.includes('\n')||s.includes('"')) return '"'+s.replace(/"/g,'""')+'"'; return s; };
+ data.forEach(r => {
+   csv += [escapeVal(r.id), escapeVal(r.name), escapeVal(r.movement), escapeVal(new Date(r.timestamp).toLocaleString('en-US', { hour12: false })), escapeVal(r.source)].join(',') + '\n';
+ });
+ const csvFile = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' });
+ const link = document.createElement('a');
+ link.href = URL.createObjectURL(csvFile);
+ link.download = `Attendance_Records_${new Date().toISOString().slice(0,10)}.csv`;
+ document.body.appendChild(link);
+ link.click();
+ document.body.removeChild(link);
+}
+
+// ----- Service Worker registration for PWA -----
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('service-worker.js').then(() => {
+      console.log('Service Worker registered');
+    }).catch(err => console.warn('SW register failed', err));
+  });
+}
+
+// disable export if no records
+try { document.getElementById('exportBtn').disabled = records.length === 0; } catch(e){}
+
+</script>
+</body>
+</html>
